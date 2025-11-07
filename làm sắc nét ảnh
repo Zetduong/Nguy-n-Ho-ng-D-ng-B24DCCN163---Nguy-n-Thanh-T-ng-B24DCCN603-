@@ -1,0 +1,183 @@
+# src/image_enhancer.py
+import cv2
+import numpy as np
+from scipy import ndimage
+from skimage import filters, exposure
+
+class ImageEnhancer:
+    def __init__(self):
+        self.enhancement_methods = {
+            'unsharp_masking': self.unsharp_masking,
+            'laplacian': self.laplacian_sharpening,
+            'frequency_domain': self.frequency_domain_enhancement,
+            'clahe': self.clahe_enhancement
+        }
+    
+    def unsharp_masking(self, image, sigma=1.0, strength=1.5, target_size=None):
+        """
+        Unsharp Masking - Kỹ thuật làm sắc nét cổ điển
+        
+        Args:
+            image: Ảnh đầu vào
+            sigma: Độ mờ Gaussian
+            strength: Cường độ làm sắc nét
+            target_size: Kích thước đích (tuple)
+        """
+        if target_size:
+            image = cv2.resize(image, target_size)
+        
+        # Tạo ảnh mờ
+        blurred = cv2.GaussianBlur(image, (0, 0), sigma)
+        
+        # Tạo mask (high-pass component)
+        mask = image.astype(np.float32) - blurred.astype(np.float32)
+        
+        # Áp dụng mask
+        sharpened = image.astype(np.float32) + strength * mask
+        
+        # Giới hạn giá trị pixel
+        sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
+        
+        return sharpened
+    
+    def laplacian_sharpening(self, image, strength=0.5):
+        """Làm sắc nét sử dụng bộ lọc Laplacian"""
+        # Kernel Laplacian
+        kernel = np.array([[0, -1, 0],
+                          [-1, 4, -1],
+                          [0, -1, 0]], dtype=np.float32)
+        
+        # Áp dụng convolution
+        laplacian = cv2.filter2D(image.astype(np.float32), -1, kernel)
+        
+        # Trừ đi thành phần Laplacian
+        sharpened = image.astype(np.float32) - strength * laplacian
+        sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
+        
+        return sharpened
+    
+    def frequency_domain_enhancement(self, image, boost_factor=1.8):
+        """Tăng cường trong miền tần số"""
+        # Biến đổi Fourier
+        dft = cv2.dft(np.float32(image), flags=cv2.DFT_COMPLEX_OUTPUT)
+        dft_shift = np.fft.fftshift(dft)
+        
+        # Tạo bộ lọc high-pass
+        rows, cols = image.shape
+        crow, ccol = rows // 2, cols // 2
+        
+        # Tạo mask high-pass
+        mask = np.ones((rows, cols, 2), np.float32)
+        r = min(rows, cols) // 4  # Giữ lại 25% tần số thấp nhất
+        center = [crow, ccol]
+        x, y = np.ogrid[:rows, :cols]
+        mask_area = (x - center[0]) ** 2 + (y - center[1]) ** 2 <= r*r
+        mask[mask_area] = 1 / boost_factor
+        
+        # Áp dụng bộ lọc
+        fshift = dft_shift * mask
+        f_ishift = np.fft.ifftshift(fshift)
+        img_back = cv2.idft(f_ishift)
+        img_back = cv2.magnitude(img_back[:,:,0], img_back[:,:,1])
+        
+        # Chuẩn hóa
+        img_back = cv2.normalize(img_back, None, 0, 255, cv2.NORM_MINMAX)
+        return img_back.astype(np.uint8)
+    
+    def clahe_enhancement(self, image, clip_limit=2.0, grid_size=(8,8)):
+        """Tăng cường độ tương phản cục bộ (CLAHE)"""
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=grid_size)
+        return clahe.apply(image)
+    
+    def enhance_image(self, image_path, method='unsharp_masking', **kwargs):
+        """
+        Tăng cường ảnh với phương pháp được chỉ định
+        
+        Args:
+            image_path: Đường dẫn ảnh
+            method: Phương pháp tăng cường
+            **kwargs: Tham số bổ sung
+        
+        Returns:
+            dict: Kết quả tăng cường
+        """
+        # Đọc ảnh
+        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise ValueError(f"Không thể đọc ảnh từ {image_path}")
+        
+        # Áp dụng phương pháp
+        if method in self.enhancement_methods:
+            enhanced = self.enhancement_methods[method](image, **kwargs)
+        else:
+            raise ValueError(f"Phương pháp {method} không được hỗ trợ")
+        
+        # Tính toán metrics
+        original_sharpness = cv2.Laplacian(image, cv2.CV_64F).var()
+        enhanced_sharpness = cv2.Laplacian(enhanced, cv2.CV_64F).var()
+        
+        return {
+            'original': image,
+            'enhanced': enhanced,
+            'sharpness_improvement': enhanced_sharpness / original_sharpness,
+            'method': method
+        }
+
+# Ứng dụng cho camera giám sát
+class SurveillanceImageEnhancer(ImageEnhancer):
+    def __init__(self):
+        super().__init__()
+        self.license_plate_pipeline = self._create_license_plate_pipeline()
+    
+    def _create_license_plate_pipeline(self):
+        """Pipeline chuyên biệt cho nhận dạng biển số xe"""
+        def pipeline(image):
+            # 1. Tăng cường độ tương phản
+            clahe_enhanced = self.clahe_enhancement(image, clip_limit=3.0)
+            
+            # 2. Làm sắc nét
+            sharpened = self.unsharp_masking(clahe_enhanced, sigma=1.0, strength=2.0)
+            
+            # 3. Lọc nhiễu
+            denoised = cv2.medianBlur(sharpened, 3)
+            
+            return denoised
+        
+        return pipeline
+    
+    def enhance_license_plate(self, image_path):
+        """Tăng cường ảnh biển số xe"""
+        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            raise ValueError("Không thể đọc ảnh")
+        
+        enhanced = self.license_plate_pipeline(image)
+        
+        # Đánh giá hiệu quả
+        evaluation = self.evaluate_enhancement(image, enhanced)
+        
+        return {
+            'original': image,
+            'enhanced': enhanced,
+            'evaluation': evaluation
+        }
+    
+    def evaluate_enhancement(self, original, enhanced):
+        """Đánh giá hiệu quả tăng cường"""
+        metrics = {}
+        
+        # Độ sắc nét (Laplacian variance)
+        metrics['sharpness_original'] = cv2.Laplacian(original, cv2.CV_64F).var()
+        metrics['sharpness_enhanced'] = cv2.Laplacian(enhanced, cv2.CV_64F).var()
+        metrics['sharpness_improvement'] = metrics['sharpness_enhanced'] / metrics['sharpness_original']
+        
+        # Độ tương phản
+        metrics['contrast_original'] = original.std()
+        metrics['contrast_enhanced'] = enhanced.std()
+        metrics['contrast_improvement'] = metrics['contrast_enhanced'] / metrics['contrast_original']
+        
+        # SNR ước lượng
+        noise = original.astype(np.float32) - cv2.GaussianBlur(original, (5,5), 0).astype(np.float32)
+        metrics['snr_original'] = original.std() / (noise.std() + 1e-8)
+        
+        return metrics
