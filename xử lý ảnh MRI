@@ -1,0 +1,393 @@
+# src/mri_processor.py
+import numpy as np
+import cv2
+from scipy import ndimage
+from skimage import exposure, filters, measure
+import matplotlib.pyplot as plt
+
+class MRIImageProcessor:
+    def __init__(self):
+        self.processing_pipelines = {
+            'tumor_detection': self.tumor_detection_pipeline,
+            'noise_reduction': self.noise_reduction_pipeline,
+            'vessel_enhancement': self.vessel_enhancement_pipeline
+        }
+    
+    def simulate_mri_acquisition(self, image, noise_level=0.02, motion_artifacts=True):
+        """
+        Mô phỏng quá trình thu thập dữ liệu MRI
+        
+        Args:
+            image: Ảnh đầu vào
+            noise_level: Mức độ nhiễu
+            motion_artifacts: Có thêm artifact do chuyển động không
+        """
+        # 1. Biến đổi Fourier 2D (từ miền không gian sang k-space)
+        k_space = np.fft.fftshift(np.fft.fft2(image.astype(np.complex128)))
+        
+        # 2. Thêm nhiễu Gaussian
+        noise_real = np.random.normal(0, noise_level * np.abs(k_space).max(), k_space.shape)
+        noise_imag = np.random.normal(0, noise_level * np.abs(k_space).max(), k_space.shape)
+        k_space_noisy = k_space + noise_real + 1j * noise_imag
+        
+        # 3. Thêm artifact do chuyển động (tùy chọn)
+        if motion_artifacts:
+            rows, cols = k_space.shape
+            # Thêm các đường artifact ngang (common in MRI)
+            for i in range(3):
+                line_pos = np.random.randint(rows//4, 3*rows//4)
+                k_space_noisy[line_pos, :] *= 0.3
+        
+        return k_space_noisy
+    
+    def reconstruct_mri_image(self, k_space_data):
+        """
+        Tái tạo ảnh MRI từ k-space
+        
+        Args:
+            k_space_data: Dữ liệu k-space (phức)
+        
+        Returns:
+            numpy.ndarray: Ảnh tái tạo
+        """
+        # 1. Biến đổi Fourier ngược
+        image_reconstructed = np.fft.ifft2(np.fft.ifftshift(k_space_data))
+        
+        # 2. Lấy phần thực và giá trị tuyệt đối
+        image_magnitude = np.abs(image_reconstructed)
+        
+        # 3. Chuẩn hóa
+        image_normalized = (image_magnitude / np.max(image_magnitude) * 255).astype(np.uint8)
+        
+        return image_normalized
+    
+    def noise_reduction_pipeline(self, image):
+        """
+        Pipeline khử nhiễu cho ảnh MRI
+        """
+        # 1. Non-local means denoising (bảo toàn biên tốt)
+        denoised = cv2.fastNlMeansDenoising(image, h=20, templateWindowSize=7, searchWindowSize=21)
+        
+        # 2. Gaussian smoothing nhẹ
+        smoothed = cv2.GaussianBlur(denoised, (3, 3), 0.8)
+        
+        # 3. Median filter để bảo vệ biên
+        final = cv2.medianBlur(smoothed, 3)
+        
+        return final
+    
+    def tumor_detection_pipeline(self, image):
+        """
+        Pipeline phát hiện khối u và vùng bất thường
+        """
+        results = {}
+        
+        # 1. Tiền xử lý và tăng cường độ tương phản
+        enhanced = exposure.equalize_adapthist(image, clip_limit=0.03)
+        enhanced = (enhanced * 255).astype(np.uint8)
+        results['enhanced'] = enhanced
+        
+        # 2. Phát hiện biên với multiple methods
+        edges_sobel = filters.sobel(enhanced)
+        edges_scharr = filters.scharr(enhanced)
+        combined_edges = np.maximum(edges_sobel, edges_scharr)
+        results['edges'] = combined_edges
+        
+        # 3. Phân ngưỡng adaptive để tìm vùng bất thường
+        binary_adaptive = cv2.adaptiveThreshold(
+            enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 11, 2
+        )
+        results['binary'] = binary_adaptive
+        
+        # 4. Phân tích connected components
+        suspicious_regions = self.analyze_regions(binary_adaptive, enhanced)
+        results['suspicious_regions'] = suspicious_regions
+        
+        # 5. Phân loại vùng nghi ngờ
+        risk_assessment = self.assess_risk_level(suspicious_regions)
+        results['risk_assessment'] = risk_assessment
+        
+        return results
+    
+    def analyze_regions(self, binary_image, original_image):
+        """
+        Phân tích các vùng connected components
+        """
+        # Nhãn hóa các vùng
+        labeled_image = measure.label(binary_image)
+        regions = measure.regionprops(labeled_image, intensity_image=original_image)
+        
+        suspicious_regions = []
+        
+        for region in regions:
+            # Lọc theo diện tích và hình dạng
+            if region.area > 50 and region.area < 10000:  # pixels
+                # Tính toán các đặc trưng
+                bbox = region.bbox  # (min_row, min_col, max_row, max_col)
+                area = region.area
+                circularity = 4 * np.pi * region.area / (region.perimeter ** 2) if region.perimeter > 0 else 0
+                mean_intensity = region.mean_intensity
+                
+                # Đánh giá mức độ nghi ngờ
+                suspicion_score = self.calculate_suspicion_score(
+                    area, circularity, mean_intensity
+                )
+                
+                if suspicion_score > 0.3:  # Ngưỡng nghi ngờ
+                    suspicious_regions.append({
+                        'bbox': bbox,
+                        'area': area,
+                        'circularity': circularity,
+                        'mean_intensity': mean_intensity,
+                        'centroid': region.centroid,
+                        'suspicion_score': suspicion_score
+                    })
+        
+        # Sắp xếp theo độ nghi ngờ giảm dần
+        suspicious_regions.sort(key=lambda x: x['suspicion_score'], reverse=True)
+        
+        return suspicious_regions
+    
+    def calculate_suspicion_score(self, area, circularity, intensity):
+        """
+        Tính điểm nghi ngờ dựa trên các đặc trưng
+        """
+        # Normalize các features
+        area_norm = min(area / 1000, 1.0)  # Giả sử area max ~1000 pixels
+        circularity_norm = circularity  # circularity ∈ [0,1]
+        intensity_norm = intensity / 255  # intensity ∈ [0,255]
+        
+        # Tính score (có thể điều chỉnh trọng số)
+        score = (0.4 * area_norm + 
+                0.3 * circularity_norm + 
+                0.3 * intensity_norm)
+        
+        return score
+    
+    def assess_risk_level(self, suspicious_regions):
+        """
+        Đánh giá mức độ rủi ro dựa trên các vùng nghi ngờ
+        """
+        if not suspicious_regions:
+            return {
+                'level': 'THẤP',
+                'description': 'Không phát hiện vùng nghi ngờ',
+                'recommendation': 'Theo dõi định kỳ'
+            }
+        
+        total_score = sum(region['suspicion_score'] for region in suspicious_regions)
+        max_score = max(region['suspicion_score'] for region in suspicious_regions)
+        
+        if total_score > 3.0 or max_score > 0.8:
+            level = 'CAO'
+            description = f'Phát hiện {len(suspicious_regions)} vùng nghi ngờ cao'
+            recommendation = 'Cần kiểm tra chuyên sâu ngay'
+        elif total_score > 1.5:
+            level = 'TRUNG BÌNH'
+            description = f'Phát hiện {len(suspicious_regions)} vùng cần theo dõi'
+            recommendation = 'Theo dõi sau 3-6 tháng'
+        else:
+            level = 'THẤP'
+            description = f'Phát hiện {len(suspicious_regions)} vùng ít nghi ngờ'
+            recommendation = 'Theo dõi định kỳ'
+        
+        return {
+            'level': level,
+            'description': description,
+            'recommendation': recommendation,
+            'total_score': total_score,
+            'region_count': len(suspicious_regions)
+        }
+    
+    def full_mri_analysis(self, image_path):
+        """
+        Phân tích MRI đầy đủ
+        """
+        # Đọc ảnh
+        mri_image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if mri_image is None:
+            # Tạo ảnh MRI mẫu cho demo
+            mri_image = self.generate_sample_mri()
+        
+        results = {}
+        
+        # Mô phỏng quá trình MRI
+        k_space = self.simulate_mri_acquisition(mri_image)
+        results['k_space'] = k_space
+        
+        # Tái tạo ảnh
+        reconstructed = self.reconstruct_mri_image(k_space)
+        results['reconstructed'] = reconstructed
+        
+        # Khử nhiễu
+        denoised = self.noise_reduction_pipeline(reconstructed)
+        results['denoised'] = denoised
+        
+        # Phân tích khối u
+        tumor_analysis = self.tumor_detection_pipeline(denoised)
+        results['tumor_analysis'] = tumor_analysis
+        
+        # Tính chất lượng
+        quality_metrics = self.calculate_quality_metrics(mri_image, denoised)
+        results['quality_metrics'] = quality_metrics
+        
+        return results
+    
+    def generate_sample_mri(self, size=512):
+        """
+        Tạo ảnh MRI mẫu cho mục đích demo
+        """
+        # Tạo nền
+        brain = np.zeros((size, size), dtype=np.uint8)
+        
+        # Vẽ hình elip giả lập não
+        center = (size//2, size//2)
+        cv2.ellipse(brain, center, (200, 220), 0, 0, 360, 80, -1)
+        
+        # Thêm chất xám
+        cv2.ellipse(brain, center, (180, 200), 0, 0, 360, 150, -1)
+        
+        # Thêm chất trắng
+        cv2.ellipse(brain, center, (160, 180), 0, 0, 360, 200, -1)
+        
+        # Thêm các cấu trúc bên trong
+        cv2.ellipse(brain, (size//2, size//3), (40, 30), 0, 0, 360, 180, -1)
+        cv2.ellipse(brain, (size//2, 2*size//3), (35, 25), 0, 0, 360, 170, -1)
+        
+        # Thêm khối u giả lập
+        tumor_center = (size//2 + 60, size//2 - 40)
+        cv2.circle(brain, tumor_center, 12, 240, -1)
+        
+        # Thêm nhiễu
+        noise = np.random.normal(0, 20, brain.shape)
+        brain = np.clip(brain.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+        
+        return brain
+    
+    def calculate_quality_metrics(self, original, processed):
+        """
+        Tính các chỉ số chất lượng ảnh
+        """
+        # SNR (Signal-to-Noise Ratio)
+        signal_power = np.mean(original ** 2)
+        noise_power = np.mean((original - processed) ** 2)
+        snr = 10 * np.log10(signal_power / noise_power) if noise_power > 0 else 100
+        
+        # CNR (Contrast-to-Noise Ratio)
+        foreground = processed[200:250, 200:250]  # Vùng foreground
+        background = processed[50:100, 50:100]    # Vùng background
+        cnr = (np.mean(foreground) - np.mean(background)) / np.std(background)
+        
+        # SSIM (Structural Similarity) đơn giản
+        from skimage.metrics import structural_similarity as ssim
+        ssim_score = ssim(original, processed, data_range=255)
+        
+        return {
+            'SNR_dB': snr,
+            'CNR': cnr,
+            'SSIM': ssim_score,
+            'contrast_improvement': processed.std() / original.std()
+        }
+
+# Lớp cho ứng dụng lâm sàng
+class ClinicalMRIAnalyzer(MRIImageProcessor):
+    def __init__(self):
+        super().__init__()
+        self.patient_data = {}
+    
+    def analyze_patient(self, patient_id, image_path, clinical_history=None):
+        """
+        Phân tích MRI cho bệnh nhân cụ thể
+        """
+        # Phân tích ảnh
+        analysis_results = self.full_mri_analysis(image_path)
+        
+        # Kết hợp với thông tin lâm sàng
+        patient_analysis = {
+            'patient_id': patient_id,
+            'image_analysis': analysis_results,
+            'clinical_history': clinical_history or {},
+            'timestamp': np.datetime64('now')
+        }
+        
+        # Lưu kết quả
+        self.patient_data[patient_id] = patient_analysis
+        
+        return patient_analysis
+    
+    def generate_clinical_report(self, patient_id):
+        """
+        Tạo báo cáo lâm sàng
+        """
+        if patient_id not in self.patient_data:
+            raise ValueError(f"Không tìm thấy dữ liệu bệnh nhân {patient_id}")
+        
+        analysis = self.patient_data[patient_id]
+        tumor_analysis = analysis['image_analysis']['tumor_analysis']
+        risk_assessment = tumor_analysis['risk_assessment']
+        quality_metrics = analysis['image_analysis']['quality_metrics']
+        
+        report = {
+            'patient_id': patient_id,
+            'examination_date': str(analysis['timestamp']),
+            'image_quality': {
+                'SNR_dB': f"{quality_metrics['SNR_dB']:.1f} dB",
+                'CNR': f"{quality_metrics['CNR']:.2f}",
+                'SSIM': f"{quality_metrics['SSIM']:.3f}"
+            },
+            'findings': {
+                'suspicious_regions_count': len(tumor_analysis['suspicious_regions']),
+                'risk_level': risk_assessment['level'],
+                'total_suspicion_score': f"{risk_assessment['total_score']:.2f}",
+                'largest_region_area': max([r['area'] for r in tumor_analysis['suspicious_regions']]) 
+                    if tumor_analysis['suspicious_regions'] else 0
+            },
+            'recommendations': self._generate_recommendations(risk_assessment),
+            'clinical_notes': self._generate_clinical_notes(analysis)
+        }
+        
+        return report
+    
+    def _generate_recommendations(self, risk_assessment):
+        """Tạo khuyến nghị dựa trên đánh giá rủi ro"""
+        base_recommendations = {
+            'THẤP': [
+                'Theo dõi định kỳ sau 12 tháng',
+                'Duy trì lối sống lành mạnh'
+            ],
+            'TRUNG BÌNH': [
+                'Theo dõi sau 6 tháng',
+                'Chụp MRI có tiêm thuốc đối quang từ',
+                'Kết hợp với các xét nghiệm hỗ trợ'
+            ],
+            'CAO': [
+                'Thăm khám chuyên khoa ngay',
+                'Chụp MRI có tiêm thuốc đối quang từ',
+                'Xem xét sinh thiết nếu cần',
+                'Hội chẩn đa khoa'
+            ]
+        }
+        
+        return base_recommendations.get(risk_assessment['level'], [])
+    
+    def _generate_clinical_notes(self, analysis):
+        """Tạo ghi chú lâm sàng"""
+        tumor_analysis = analysis['image_analysis']['tumor_analysis']
+        regions = tumor_analysis['suspicious_regions']
+        
+        notes = []
+        
+        if not regions:
+            notes.append("Không phát hiện vùng bất thường đáng ngờ.")
+        else:
+            notes.append(f"Phát hiện {len(regions)} vùng nghi ngờ.")
+            
+            for i, region in enumerate(regions[:3], 1):  # Chỉ liệt kê 3 vùng đầu
+                notes.append(
+                    f"Vùng {i}: Diện tích {region['area']}px, "
+                    f"độ tròn {region['circularity']:.2f}, "
+                    f"điểm nghi ngờ {region['suspicion_score']:.2f}"
+                )
+        
+        return notes
