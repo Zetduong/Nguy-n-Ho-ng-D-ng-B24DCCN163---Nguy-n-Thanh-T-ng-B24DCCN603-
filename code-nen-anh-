@@ -1,0 +1,113 @@
+# src/jpeg_compressor.py
+import numpy as np
+import cv2
+from scipy.fftpack import dct, idct
+from PIL import Image
+import os
+
+class JPEGCompressor:
+    def __init__(self, quality=75):
+        self.quality = quality
+        self.quantization_matrix = self._generate_quantization_matrix()
+    
+    def _generate_quantization_matrix(self):
+        """Tạo ma trận lượng tử hóa theo chất lượng"""
+        base_matrix = np.array([
+            [16, 11, 10, 16, 24, 40, 51, 61],
+            [12, 12, 14, 19, 26, 58, 60, 55],
+            [14, 13, 16, 24, 40, 57, 69, 56],
+            [14, 17, 22, 29, 51, 87, 80, 62],
+            [18, 22, 37, 56, 68, 109, 103, 77],
+            [24, 35, 55, 64, 81, 104, 113, 92],
+            [49, 64, 78, 87, 103, 121, 120, 101],
+            [72, 92, 95, 98, 112, 100, 103, 99]
+        ])
+        
+        if self.quality > 50:
+            scale = (100 - self.quality) / 50
+        else:
+            scale = 50 / self.quality
+            
+        return base_matrix * scale
+    
+    def dct2(self, block):
+        """Biến đổi DCT 2D"""
+        return dct(dct(block.T, norm='ortho').T, norm='ortho')
+    
+    def idct2(self, block):
+        """Biến đổi DCT ngược 2D"""
+        return idct(idct(block.T, norm='ortho').T, norm='ortho')
+    
+    def compress_image(self, input_path, output_path, max_dimension=1200):
+        """
+        Nén ảnh với chất lượng cao cho web
+        
+        Args:
+            input_path: Đường dẫn ảnh đầu vào
+            output_path: Đường dẫn ảnh đầu ra
+            max_dimension: Kích thước tối đa (px)
+        
+        Returns:
+            dict: Kết quả nén
+        """
+        try:
+            # Đọc và resize ảnh
+            with Image.open(input_path) as img:
+                original_size = img.size
+                img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+                
+                # Chuyển sang RGB nếu cần
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # Lưu với chất lượng tối ưu
+                img.save(output_path, 'JPEG', quality=self.quality, optimize=True)
+            
+            # Tính toán thống kê
+            original_file_size = os.path.getsize(input_path)
+            compressed_file_size = os.path.getsize(output_path)
+            
+            return {
+                'success': True,
+                'original_size': original_file_size,
+                'compressed_size': compressed_file_size,
+                'compression_ratio': original_file_size / compressed_file_size,
+                'original_dimensions': original_size,
+                'compressed_dimensions': img.size
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
+# Ví dụ sử dụng trong thương mại điện tử
+class EcommerceImageOptimizer:
+    def __init__(self, quality_levels={'thumbnail': 60, 'product': 75, 'zoom': 85}):
+        self.quality_levels = quality_levels
+        self.compressors = {
+            size: JPEGCompressor(quality) 
+            for size, quality in quality_levels.items()
+        }
+    
+    def optimize_product_images(self, input_folder, output_folder):
+        """Tối ưu hóa toàn bộ ảnh sản phẩm"""
+        results = []
+        
+        for filename in os.listdir(input_folder):
+            if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+                input_path = os.path.join(input_folder, filename)
+                
+                # Tạo các phiên bản với chất lượng khác nhau
+                for size_name, compressor in self.compressors.items():
+                    output_filename = f"{os.path.splitext(filename)[0]}_{size_name}.jpg"
+                    output_path = os.path.join(output_folder, output_filename)
+                    
+                    result = compressor.compress_image(input_path, output_path)
+                    if result['success']:
+                        result['filename'] = output_filename
+                        result['size_type'] = size_name
+                        results.append(result)
+        
+        return results
